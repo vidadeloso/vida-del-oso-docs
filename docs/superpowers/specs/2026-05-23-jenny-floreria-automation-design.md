@@ -97,11 +97,37 @@ flowers (
 
 -- Customers
 customers (
-  id                uuid PRIMARY KEY,
-  whatsapp_phone    text UNIQUE NOT NULL, -- "+521XXXXXXXXXX"
-  name              text,
-  address_default   jsonb,               -- saved address for repeat orders
-  created_at        timestamptz DEFAULT now()
+  id                      uuid PRIMARY KEY,
+  whatsapp_phone          text UNIQUE NOT NULL,  -- "+521XXXXXXXXXX"
+  display_name            text,                  -- "María" — used in AI greetings
+  saved_addresses         jsonb[],               -- up to 5 saved addresses (same structure as delivery_address)
+  total_orders_completed  integer DEFAULT 0,     -- incremented on every delivered order
+  loyalty_tier            text DEFAULT 'none',
+    -- "none" | "silver" (5+ orders) | "gold" (10+ orders) | "vip" (20+ orders)
+  birthday_month_day      text,                  -- "05-10" (MM-DD) — optional, if customer shares
+  carmelita_notes         text,                  -- private notes Carmelita adds (allergies, preferences, VIP, etc.)
+  created_at              timestamptz DEFAULT now()
+)
+
+-- Loyalty tier definitions (configurable by Carmelita)
+loyalty_tiers (
+  id                    uuid PRIMARY KEY,
+  tier_name             text UNIQUE NOT NULL,  -- "silver" | "gold" | "vip"
+  min_orders_required   integer NOT NULL,      -- 5 / 10 / 20
+  discount_percent      integer NOT NULL,      -- 10 / 15 / 20
+  applicable_occasions  text[],
+    -- ["mothers_day","valentines","dia_muertos","christmas","customer_birthday"]
+  active                boolean DEFAULT true
+)
+
+-- Tracks when a customer used a loyalty reward (prevents double-use per occasion per year)
+customer_reward_uses (
+  id               uuid PRIMARY KEY,
+  customer_id      uuid REFERENCES customers,
+  order_id         uuid REFERENCES orders,
+  occasion         text,          -- "mothers_day" / "valentines" / "dia_muertos" / "christmas" / "customer_birthday"
+  discount_percent integer,
+  used_at          timestamptz DEFAULT now()
 )
 
 -- Orders
@@ -266,6 +292,23 @@ pending → confirmed → partially_paid ─┐
 
 Each status change fires a Supabase trigger → n8n webhook → appropriate WhatsApp messages sent.
 
+### Default Seed Data
+
+`loyalty_tiers` pre-populated at setup:
+```
+Silver: 5+ orders  → 10% off → mothers_day, valentines, dia_muertos, christmas, customer_birthday
+Gold:  10+ orders  → 15% off → same occasions
+VIP:   20+ orders  → 20% off → same occasions
+```
+Carmelita can adjust thresholds and percentages from dashboard Settings at any time.
+
+`app_settings` pre-populated:
+```
+delivery_fee_mxn              = 50
+free_delivery_threshold_mxn   = null  (off by default)
+driver_rate_per_delivery_mxn  = 80
+```
+
 ### Order Total Calculation
 ```
 subtotal_mxn      = sum of all order_items.line_total_mxn
@@ -331,14 +374,69 @@ Check orders.human_handoff for this customer phone
                   sent to customer
 ```
 
+### Returning Customer Recognition
+
+Every incoming message: n8n looks up customer by `whatsapp_phone` before calling GPT-4o.
+
+**New customer** → AI introduces itself, collects name, saves to `customers.display_name`.
+
+**Returning customer** → AI greets by name, offers saved addresses:
+```
+"¡Hola María! 🌸 Qué gusto verte de nuevo.
+
+¿Tu pedido va a alguna de estas direcciones?
+1️⃣ Calle Juárez 45, Col. Centro (casa blanca)
+2️⃣ Av. Obregón 230, Col. Las Flores
+3️⃣ Usar una dirección nueva"
+```
+Customer taps 1 or 2 → address pre-filled, no re-entry needed.
+Customer taps 3 → AI collects all 6 fields as normal, then asks: "¿Quieres guardar esta dirección para la próxima vez?" → yes → saved to `saved_addresses`.
+
+Up to 5 addresses saved per customer. If 5 already exist, newest replaces oldest.
+
+### Loyalty Reward Check (Every Order)
+
+After returning customer greet, n8n checks:
+1. Is today within 7 days before a qualifying occasion?
+2. Does customer's `loyalty_tier` cover that occasion?
+3. Has customer already used this reward this calendar year for this occasion? (checks `customer_reward_uses`)
+
+If all yes → AI mentions reward before order:
+```
+"🎉 ¡María, tienes un regalo especial!
+Por ser clienta fiel (8 pedidos con nosotros),
+tienes 10% de descuento para el Día de las Madres.
+
+¿Quieres aplicarlo a tu pedido de hoy? Responde SÍ o NO"
+```
+
+If customer is 1 order away from next tier:
+```
+"🌟 ¡Este es tu pedido número 9, María!
+Con solo 1 pedido más subes a Gold y obtienes
+15% de descuento en San Valentín, Día de las
+Madres, Día de Muertos y Navidad. 🌺"
+```
+
+**Special occasions and dates (Mexico):**
+| Occasion key | Date |
+|---|---|
+| `mothers_day` | May 10 (fixed in Mexico) |
+| `valentines` | February 14 |
+| `dia_muertos` | November 1–2 |
+| `christmas` | December 24–25 |
+| `customer_birthday` | customer's `birthday_month_day` ± 7 days |
+
 ### GPT-4o Capabilities (No Escalation Needed)
+- Recognize returning customers by name, offer saved addresses
 - Browse inventory ("¿qué rosas tienen?", "¿qué hay para un funeral?")
 - Get prices and availability
 - Recommend flowers by occasion
-- Place order (collects all 6 address fields, occasion, card message, delivery time)
-- Apply and validate promo codes
+- Place order (collects all 6 address fields or uses saved address, occasion, card message, delivery time)
+- Apply and validate promo codes + loyalty rewards
 - Check order status ("¿ya salió mi pedido?")
 - FAQ ("¿a qué hora entregan?", "¿cuánto tarda?", "¿dónde están ubicados?")
+- Save new delivery addresses for returning customers
 
 ### Elderly-Friendly WhatsApp UX
 - AI always presents numbered options when there are choices:
@@ -770,10 +868,45 @@ Carmelita sets `driver_rate_per_delivery_mxn` (default $80 MXN). Adjustable per 
 - Toggle active/inactive
 - Usage counter displayed per code
 
-### Panel 5 — Customers
-- Customer list with name, phone, total orders, total spent, last order date
-- Tap customer → full order history
-- Useful for loyalty tracking and repeat customer recognition
+### Panel 5 — Customers & Loyalty
+
+**Customer list:**
+```
+┌─────────────────────────────────────┐
+│ 👥 CLIENTES                         │
+├─────────────────────────────────────┤
+│ 🥇 María García         VIP · 23 📦 │
+│ Última compra: ayer · $410 MXN      │
+│ 🎂 Cumple: 10 mayo                  │
+├─────────────────────────────────────┤
+│ 🥈 Rosa Ríos         Silver · 6 📦  │
+│ Última compra: hace 3 días          │
+├─────────────────────────────────────┤
+│ Luis Mendoza              None · 2  │
+│ Última compra: hace 1 semana        │
+└─────────────────────────────────────┘
+```
+
+Tap customer → full profile:
+- Name, phone, all saved addresses (view/delete)
+- Total orders completed, total spent lifetime
+- Loyalty tier + progress to next tier ("6 pedidos · 4 más para Gold")
+- Birthday month/day (editable)
+- Carmelita's private notes (allergies, VIP flag, preferences)
+- Full order history
+
+**Loyalty tier management:**
+Carmelita can view and edit tier thresholds in Settings:
+```
+🥈 Silver:  5+ pedidos → 10% desc. en ocasiones especiales
+🥇 Gold:   10+ pedidos → 15% desc. en ocasiones especiales
+💎 VIP:    20+ pedidos → 20% desc. en ocasiones especiales
+```
+Can toggle which occasions qualify per tier.
+
+**Loyalty milestone notification in dashboard:**
+When a customer completes an order that pushes them to a new tier → notification badge appears:
+"🎉 María García subió a Gold (10 pedidos)"
 
 ### Panel 6 — Settings (Delivery Fee + Driver Rates)
 
@@ -835,6 +968,8 @@ Carmelita stays informed via WhatsApp on her personal number. Dashboard is for m
 | Plan fully paid | "🎉 ¡Pago completo! Pedido #052 Boda García · $8,500 MXN pagados · Evento: 15 junio" |
 | Driver payment pending (cash) | "💵 Pagar a Marco en efectivo · Pedido #045 · $80 MXN" |
 | Driver payment pending (transfer) | "🏦 Transferir a Pedro · $80 MXN · CLABE: 012180XXXXXXXXXX · BBVA" |
+| Customer reached new loyalty tier | "🎉 María García completó 10 pedidos · Subió a Gold · 15% desc. en ocasiones especiales" |
+| Upcoming occasion — loyalty customers eligible | "🌸 El Día de las Madres es en 5 días · 3 clientas tienen descuento disponible: María G., Rosa R., Carmen L." |
 
 ---
 
@@ -1156,6 +1291,9 @@ After system is live, her daily tasks are minimal:
 | Create event/wedding payment plan | Dashboard → Pedidos → [+ Evento/Boda] → fill form → system sends plan to customer |
 | Check installment status | Dashboard → Eventos → see progress bar per order |
 | Update delivery fee | Dashboard → Configuración → change amount → [Guardar] |
+| View customer loyalty status | Dashboard → Clientes → see tier badges and order counts |
+| Add notes to a customer | Dashboard → Clientes → tap customer → edit notes field |
+| View eligible loyalty customers before big occasion | WhatsApp notification 7 days before occasion lists who qualifies |
 | View today's revenue | Dashboard → Ventas |
 
 She does NOT need to:
