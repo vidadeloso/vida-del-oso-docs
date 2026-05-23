@@ -106,34 +106,40 @@ customers (
 
 -- Orders
 orders (
-  id                  uuid PRIMARY KEY,
-  order_number        serial,              -- human-readable #001, #002...
-  customer_id         uuid REFERENCES customers,
-  order_type          text DEFAULT 'standard',
+  id                      uuid PRIMARY KEY,
+  order_number            serial,              -- human-readable #001, #002...
+  customer_id             uuid REFERENCES customers,
+  order_type              text DEFAULT 'standard',
     -- "standard" | "event" | "wedding"
-  status              text DEFAULT 'pending',
+  status                  text DEFAULT 'pending',
     -- pending → confirmed → paid → driver_assigned → in_delivery → delivered → cancelled
-    -- for event/wedding with payment plan: partially_paid is also valid between confirmed and paid
-  items_json          jsonb,               -- snapshot of ordered items + customizations at time of order
-  subtotal_mxn        numeric(10,2),
-  discount_amount_mxn numeric(10,2) DEFAULT 0,
-  total_mxn           numeric(10,2),
-  amount_paid_mxn     numeric(10,2) DEFAULT 0,   -- tracks partial payments
-  delivery_address    jsonb,               -- structured (see below)
-  delivery_notes      text,
-  occasion            text,               -- "birthday" / "anniversary" / "quinceañera" / "wedding" / etc.
-  occasion_card_msg   text,               -- message to print on card
-  event_date          date,               -- for weddings/events — the actual event day
-  scheduled_delivery_at timestamptz,      -- null = ASAP
-  driver_id           uuid REFERENCES drivers,
-  mp_payment_id       text,               -- MercadoPago preference ID (standard orders)
-  mp_payment_status   text,
-  payment_plan_id     uuid,               -- FK to payment_plans (event/wedding orders)
-  promo_code_id       uuid REFERENCES promo_codes,
-  delivery_photo_url  text,              -- photo sent by driver on completion
-  human_handoff       boolean DEFAULT false,
-  created_at          timestamptz DEFAULT now(),
-  updated_at          timestamptz DEFAULT now()
+    -- event/wedding: partially_paid valid between confirmed → paid
+  items_json              jsonb,               -- snapshot of items + customizations at order time
+  subtotal_mxn            numeric(10,2),       -- sum of all order_items.line_total_mxn
+  discount_amount_mxn     numeric(10,2) DEFAULT 0,
+  delivery_fee_mxn        numeric(10,2) DEFAULT 0,  -- from app_settings at time of order
+  total_mxn               numeric(10,2),
+    -- total = subtotal - discount + delivery_fee
+  amount_paid_mxn         numeric(10,2) DEFAULT 0,
+  delivery_address        jsonb,
+  delivery_notes          text,
+  occasion                text,
+  occasion_card_msg       text,
+  event_date              date,
+  scheduled_delivery_at   timestamptz,
+  driver_id               uuid REFERENCES drivers,
+  driver_payment_method   text,                -- "cash" | "transfer" — set when driver assigned
+  driver_payment_status   text DEFAULT 'pending',
+    -- "pending" | "paid"  — updated by Carmelita after delivery
+  driver_payment_amount_mxn numeric(10,2),     -- amount owed to driver for this delivery
+  mp_payment_id           text,
+  mp_payment_status       text,
+  payment_plan_id         uuid,
+  promo_code_id           uuid REFERENCES promo_codes,
+  delivery_photo_url      text,
+  human_handoff           boolean DEFAULT false,
+  created_at              timestamptz DEFAULT now(),
+  updated_at              timestamptz DEFAULT now()
 )
 
 -- delivery_address JSON structure:
@@ -171,7 +177,25 @@ drivers (
   whatsapp_phone    text UNIQUE NOT NULL,
   active            boolean DEFAULT true,
   current_order_id  uuid REFERENCES orders,  -- null = available
+  preferred_payment text DEFAULT 'cash',      -- "cash" | "transfer"
+  bank_clabe        text,                     -- 18-digit CLABE for SPEI transfers
+  bank_name         text,                     -- "BBVA" / "Banamex" / "Bancomer" etc.
   created_at        timestamptz DEFAULT now()
+)
+
+-- App-wide settings (single row, id = 'default')
+app_settings (
+  id                        text PRIMARY KEY DEFAULT 'default',
+  delivery_fee_mxn          numeric(10,2) DEFAULT 50,
+    -- flat fee added to every order total
+  free_delivery_threshold_mxn numeric(10,2),
+    -- null = never free; set to e.g. 500 = free delivery on orders ≥ $500 MXN
+  driver_rate_per_delivery_mxn numeric(10,2) DEFAULT 80,
+    -- what Carmelita pays each driver per completed delivery
+  shop_whatsapp_phone       text,             -- Carmelita's personal number for notifications
+  shop_name                 text DEFAULT 'Jenny Florería',
+  shop_city                 text DEFAULT 'Guasave, Sinaloa',
+  updated_at                timestamptz DEFAULT now()
 )
 
 -- Promotional codes
@@ -241,6 +265,17 @@ pending → confirmed → partially_paid ─┐
 ```
 
 Each status change fires a Supabase trigger → n8n webhook → appropriate WhatsApp messages sent.
+
+### Order Total Calculation
+```
+subtotal_mxn      = sum of all order_items.line_total_mxn
+discount_mxn      = promo code value (if applied)
+delivery_fee_mxn  = app_settings.delivery_fee_mxn
+                    (waived if subtotal ≥ free_delivery_threshold_mxn)
+─────────────────────────────────────────────
+total_mxn         = subtotal - discount + delivery_fee
+```
+Delivery fee locked in at order creation time so future setting changes don't affect existing orders.
 
 ### Low Stock Alert
 When `stock_count < 5` on any active flower → n8n sends WhatsApp alert to Carmelita's personal number + creates notification record.
@@ -328,7 +363,10 @@ Check orders.human_handoff for this customer phone
   📍 Calle Juárez 45, entre Obregón y Zaragoza
       Casa blanca · frente al OXXO
   🕒 Hoy a las 3:00pm
-  💰 Total: $360 MXN
+  ─────────────────────
+  🛍️ Subtotal:  $360 MXN
+  🚚 Envío:      $50 MXN
+  💰 Total:     $410 MXN
   
   ¿Confirmo? Responde SÍ o NO
   ```
@@ -695,11 +733,36 @@ Per item, Carmelita can define available options customers can choose:
 - Add-ons with prices (jarrón, listón, tarjeta impresa, etc.)
 These appear in the catalog and are collected by the AI during ordering.
 
-### Panel 3 — Driver Status
-- Each driver shown with availability status (large colored dot)
-- 🟢 DISPONIBLE / 🔴 EN RUTA
-- Shows current assigned order if in route
-- Tap driver → edit name, phone, active status
+### Panel 3 — Driver Status & Payments
+
+**Driver availability:**
+- Each driver shown with large colored dot: 🟢 DISPONIBLE / 🔴 EN RUTA
+- Shows current assigned order and destination if in route
+- Tap driver → edit name, phone, active status, payment preference (Efectivo / Transferencia), CLABE
+
+**Pending driver payments (shown after each delivery):**
+```
+┌─────────────────────────────────────┐
+│ 💰 PAGOS PENDIENTES A REPARTIDORES  │
+├─────────────────────────────────────┤
+│ Marco · Pedido #045                 │
+│ $80 MXN · Efectivo                  │
+│ [✅ Marcar como Pagado]             │
+├─────────────────────────────────────┤
+│ Pedro · Pedido #046                 │
+│ $80 MXN · Transferencia             │
+│ CLABE: 012 180 XXXXXXXX XX          │
+│ BBVA · Pedro López                  │
+│ [✅ Marcar como Pagado]             │
+└─────────────────────────────────────┘
+```
+- CLABE and bank displayed for transfer payments so Carmelita can send without looking it up
+- After tapping [Marcar como Pagado] → confirmation dialog → `driver_payment_status = "paid"`
+- Paid items disappear from pending list
+- Driver payment history accessible via tap on driver name
+
+**Driver payment settings (in app_settings):**
+Carmelita sets `driver_rate_per_delivery_mxn` (default $80 MXN). Adjustable per driver if needed via driver profile.
 
 ### Panel 4 — Promo Codes
 - List of all codes with status, discount, uses remaining, expiry
@@ -712,14 +775,42 @@ These appear in the catalog and are collected by the AI during ordering.
 - Tap customer → full order history
 - Useful for loyalty tracking and repeat customer recognition
 
-### Panel 6 — Revenue Summary
+### Panel 6 — Settings (Delivery Fee + Driver Rates)
+
+Simple settings screen — large inputs, clear labels:
+
+```
+┌─────────────────────────────────────┐
+│ ⚙️ CONFIGURACIÓN                    │
+├─────────────────────────────────────┤
+│ Costo de envío:                     │
+│  [ $50 MXN ]                        │
+│                                     │
+│ Envío gratis en pedidos mayores de: │
+│  [ $500 MXN ] (dejar en 0 = nunca) │
+│                                     │
+│ Pago a repartidores por entrega:    │
+│  [ $80 MXN ]                        │
+├─────────────────────────────────────┤
+│            [💾 Guardar]             │
+└─────────────────────────────────────┘
+```
+
+Changes take effect on new orders immediately. Existing orders unaffected.
+
+### Panel 7 — Revenue Summary
 ```
 📅 Hoy:          $1,240 MXN  (4 pedidos)
 📅 Esta semana:  $6,890 MXN  (23 pedidos)
 📅 Este mes:     $28,440 MXN (91 pedidos)
+
+💚 Ingresos por envíos hoy:       $200 MXN
+💵 Pagado a repartidores hoy:     $240 MXN
+⏳ Pagos pendientes repartidores:  $80 MXN
 ```
 - Top 5 selling flowers
 - Busiest delivery hours
+- Driver payment summary (paid vs pending this week)
 - No complex charts — plain numbers in large text
 
 ---
@@ -742,6 +833,8 @@ Carmelita stays informed via WhatsApp on her personal number. Dashboard is for m
 | Installment due in 3 days | "📅 Próximo abono · Pedido #052 Boda García · $1,500 MXN · Vence: Viernes 30 mayo" |
 | Installment overdue | "🚨 Abono vencido · Pedido #052 Boda García · $1,500 MXN · Venció hace 2 días" |
 | Plan fully paid | "🎉 ¡Pago completo! Pedido #052 Boda García · $8,500 MXN pagados · Evento: 15 junio" |
+| Driver payment pending (cash) | "💵 Pagar a Marco en efectivo · Pedido #045 · $80 MXN" |
+| Driver payment pending (transfer) | "🏦 Transferir a Pedro · $80 MXN · CLABE: 012180XXXXXXXXXX · BBVA" |
 
 ---
 
@@ -1056,10 +1149,13 @@ After system is live, her daily tasks are minimal:
 | Check new orders | Glance at WhatsApp notifications or open dashboard |
 | Add new arrival flowers/ornaments | Dashboard → Inventario → [📦 Llegó Mercancía] → 4 steps, ~60 sec per item |
 | Update existing flower stock | Dashboard → Inventario → tap flower → tap stock number → update |
+| Pay a driver (cash) | Dashboard → Repartidores → Pagos Pendientes → [Marcar como Pagado] |
+| Pay a driver (transfer) | Dashboard → Repartidores → Pagos Pendientes → copy CLABE → transfer in banking app → [Marcar como Pagado] |
 | Handle escalated customer | Reply to WhatsApp forwarded message → type LISTO when done |
 | Create a promo code | Dashboard → Códigos → [+ Crear Código] |
 | Create event/wedding payment plan | Dashboard → Pedidos → [+ Evento/Boda] → fill form → system sends plan to customer |
 | Check installment status | Dashboard → Eventos → see progress bar per order |
+| Update delivery fee | Dashboard → Configuración → change amount → [Guardar] |
 | View today's revenue | Dashboard → Ventas |
 
 She does NOT need to:
