@@ -58,6 +58,8 @@ Links        Dispatch
 | 4 | Voice AI Agent (Vapi.ai + ElevenLabs) | Phase 1, 3 |
 | 5 | Delivery Dispatch | Phase 3 |
 | 6 | Owner Dashboard + Notifications | Phase 1+ |
+| 7 | Public Customer Catalog (web) | Phase 1 |
+| 8 | Event & Wedding Installment Payments | Phase 3 |
 
 ---
 
@@ -66,18 +68,31 @@ Links        Dispatch
 ### Tables
 
 ```sql
--- Flower inventory
+-- Flower & ornament inventory
 flowers (
-  id                uuid PRIMARY KEY,
-  name              text NOT NULL,
-  description       text,
-  price_mxn         numeric(10,2) NOT NULL,
-  category          text,
-  stock_count       integer DEFAULT 0,
-  image_url         text,               -- Supabase Storage bucket
-  occasion_tags     text[],             -- ["birthday","anniversary","funeral","quinceañera","general"]
-  active            boolean DEFAULT true,
-  created_at        timestamptz DEFAULT now()
+  id                    uuid PRIMARY KEY,
+  name                  text NOT NULL,
+  description           text,
+  price_mxn             numeric(10,2) NOT NULL,
+  category              text,
+    -- "flores" | "arreglos" | "ornamentos" | "coronas" |
+    -- "centros_de_mesa" | "bouquets_boda" | "decoracion_evento"
+  stock_count           integer DEFAULT 0,
+  image_url             text,               -- Supabase Storage bucket
+  occasion_tags         text[],             -- ["birthday","anniversary","funeral","quinceañera","wedding","general"]
+  customization_options jsonb,
+    -- {
+    --   "sizes":  [{"label":"Pequeño","price_mxn":150},
+    --              {"label":"Mediano","price_mxn":250},
+    --              {"label":"Grande", "price_mxn":350}],
+    --   "colors": ["Rojo","Blanco","Rosa","Amarillo","Morado"],
+    --   "addons": [{"label":"Jarrón de vidrio","price_mxn":50},
+    --              {"label":"Listón personalizado","price_mxn":20},
+    --              {"label":"Tarjeta impresa","price_mxn":15}]
+    -- }
+    -- null = no customization available for this item
+  active                boolean DEFAULT true,
+  created_at            timestamptz DEFAULT now()
 )
 
 -- Customers
@@ -91,28 +106,34 @@ customers (
 
 -- Orders
 orders (
-  id                uuid PRIMARY KEY,
-  order_number      serial,              -- human-readable #001, #002...
-  customer_id       uuid REFERENCES customers,
-  status            text DEFAULT 'pending',
+  id                  uuid PRIMARY KEY,
+  order_number        serial,              -- human-readable #001, #002...
+  customer_id         uuid REFERENCES customers,
+  order_type          text DEFAULT 'standard',
+    -- "standard" | "event" | "wedding"
+  status              text DEFAULT 'pending',
     -- pending → confirmed → paid → driver_assigned → in_delivery → delivered → cancelled
-  items_json        jsonb,               -- snapshot of ordered items at time of order
-  subtotal_mxn      numeric(10,2),
+    -- for event/wedding with payment plan: partially_paid is also valid between confirmed and paid
+  items_json          jsonb,               -- snapshot of ordered items + customizations at time of order
+  subtotal_mxn        numeric(10,2),
   discount_amount_mxn numeric(10,2) DEFAULT 0,
-  total_mxn         numeric(10,2),
-  delivery_address  jsonb,               -- structured (see below)
-  delivery_notes    text,
-  occasion          text,               -- "birthday" / "anniversary" / "quinceañera" / etc.
-  occasion_card_msg text,               -- message to print on card
-  scheduled_delivery_at timestamptz,    -- null = ASAP
-  driver_id         uuid REFERENCES drivers,
-  mp_payment_id     text,               -- MercadoPago preference ID
-  mp_payment_status text,
-  promo_code_id     uuid REFERENCES promo_codes,
-  delivery_photo_url text,              -- photo sent by driver on completion
-  human_handoff     boolean DEFAULT false,
-  created_at        timestamptz DEFAULT now(),
-  updated_at        timestamptz DEFAULT now()
+  total_mxn           numeric(10,2),
+  amount_paid_mxn     numeric(10,2) DEFAULT 0,   -- tracks partial payments
+  delivery_address    jsonb,               -- structured (see below)
+  delivery_notes      text,
+  occasion            text,               -- "birthday" / "anniversary" / "quinceañera" / "wedding" / etc.
+  occasion_card_msg   text,               -- message to print on card
+  event_date          date,               -- for weddings/events — the actual event day
+  scheduled_delivery_at timestamptz,      -- null = ASAP
+  driver_id           uuid REFERENCES drivers,
+  mp_payment_id       text,               -- MercadoPago preference ID (standard orders)
+  mp_payment_status   text,
+  payment_plan_id     uuid,               -- FK to payment_plans (event/wedding orders)
+  promo_code_id       uuid REFERENCES promo_codes,
+  delivery_photo_url  text,              -- photo sent by driver on completion
+  human_handoff       boolean DEFAULT false,
+  created_at          timestamptz DEFAULT now(),
+  updated_at          timestamptz DEFAULT now()
 )
 
 -- delivery_address JSON structure:
@@ -131,7 +152,16 @@ order_items (
   order_id          uuid REFERENCES orders,
   flower_id         uuid REFERENCES flowers,
   quantity          integer NOT NULL,
-  unit_price_mxn    numeric(10,2) NOT NULL  -- price at time of order
+  unit_price_mxn    numeric(10,2) NOT NULL,  -- base price at time of order
+  customizations    jsonb,
+    -- {
+    --   "size":   "Mediano",
+    --   "color":  "Rosa",
+    --   "addons": ["Jarrón de vidrio","Listón personalizado"],
+    --   "addon_total_mxn": 70,
+    --   "custom_note": "listón color azul cielo si es posible"
+    -- }
+  line_total_mxn    numeric(10,2)            -- (unit_price + addon_total) × quantity
 )
 
 -- Delivery drivers
@@ -158,10 +188,38 @@ promo_codes (
   created_at        timestamptz DEFAULT now()
 )
 
+-- Event / wedding payment plans
+payment_plans (
+  id                uuid PRIMARY KEY,
+  order_id          uuid REFERENCES orders,
+  total_amount_mxn  numeric(10,2) NOT NULL,
+  amount_paid_mxn   numeric(10,2) DEFAULT 0,
+  status            text DEFAULT 'active',
+    -- "active" | "completed" | "overdue" | "cancelled"
+  created_at        timestamptz DEFAULT now()
+)
+
+-- Individual installments within a payment plan
+payment_installments (
+  id                    uuid PRIMARY KEY,
+  payment_plan_id       uuid REFERENCES payment_plans,
+  installment_number    integer NOT NULL,        -- 1, 2, 3...
+  amount_mxn            numeric(10,2) NOT NULL,
+  due_date              date NOT NULL,
+  status                text DEFAULT 'pending',
+    -- "pending" | "paid" | "overdue"
+  mp_payment_id         text,                    -- MercadoPago reference when paid
+  paid_at               timestamptz,
+  reminder_sent_at      timestamptz,             -- last reminder WhatsApp sent
+  created_at            timestamptz DEFAULT now()
+)
+
 -- System notifications (dashboard feed)
 notifications (
   id                uuid PRIMARY KEY,
-  type              text,   -- "new_order" | "payment" | "driver" | "delivery" | "low_stock" | "handoff"
+  type              text,
+    -- "new_order" | "payment" | "driver" | "delivery" | "low_stock"
+    -- "handoff" | "installment_due" | "installment_paid" | "plan_overdue"
   message           text,
   order_id          uuid REFERENCES orders,
   read              boolean DEFAULT false,
@@ -171,8 +229,15 @@ notifications (
 
 ### Order Status Flow
 ```
+Standard orders:
 pending → confirmed → paid → driver_assigned → in_delivery → delivered
                                                            ↘ cancelled (any stage)
+
+Event / wedding orders (payment plan):
+pending → confirmed → partially_paid ─┐
+                                       ├─ (installments paid over time)
+                                       ▼
+                                      paid → driver_assigned → in_delivery → delivered
 ```
 
 Each status change fires a Supabase trigger → n8n webhook → appropriate WhatsApp messages sent.
@@ -601,11 +666,34 @@ Real-time order feed, sorted by urgency (soonest delivery first). Each card show
 - Tap to expand full detail
 
 ### Panel 2 — Inventory Manager
-- List of all flowers with photo thumbnail, name, price, stock count
-- Stock count shown large with color: green (>10), yellow (5-10), red (<5)
-- [+ Agregar Flor] button — form with photo upload, name, description, price, stock, occasions
-- Toggle active/inactive per flower — deactivated flowers removed from AI inventory instantly
-- Edit price or stock count with single tap
+
+**Quick-Add for New Arrivals ("Llegó mercancía" flow)**
+When a new shipment arrives, Carmelita taps [📦 Llegó Mercancía] — a streamlined 4-step flow optimized for speed:
+```
+Step 1: Photo         → tap to open camera or photo roll
+Step 2: Name + type   → text field + category picker (Flores/Arreglos/Ornamentos/
+                        Coronas/Centro de Mesa/Bouquet Boda/Decoración Evento)
+Step 3: Price + stock → two large number inputs
+Step 4: Occasions     → checkbox grid (Cumpleaños/Aniversario/Boda/
+                        Quinceañera/Funeral/General)
+→ [Guardar] → item live in catalog and AI inventory immediately
+```
+Entire flow completable in under 60 seconds per item. No technical knowledge required.
+
+**Full Inventory List**
+- Items grouped by category with category header badges
+- Each card: photo thumbnail, name, price (large), stock count (color-coded)
+  - 🟢 Verde: >10 units · 🟡 Amarillo: 5–10 units · 🔴 Rojo: <5 units
+- Tap item → edit any field: price, stock, description, occasions, customization options
+- [Desactivar] toggle → item hidden from AI and catalog instantly
+- [+ Agregar] for single-item manual add (same 4-step flow as above)
+
+**Customization Options Editor**
+Per item, Carmelita can define available options customers can choose:
+- Sizes (with price per size)
+- Color choices
+- Add-ons with prices (jarrón, listón, tarjeta impresa, etc.)
+These appear in the catalog and are collected by the AI during ordering.
 
 ### Panel 3 — Driver Status
 - Each driver shown with availability status (large colored dot)
@@ -650,10 +738,282 @@ Carmelita stays informed via WhatsApp on her personal number. Dashboard is for m
 | No driver available | "🚨 Sin repartidor disponible · Pedido #047 necesita atención manual" |
 | Customer needs help | "👤 Cliente necesita asistencia · [name] · Último mensaje: [message]. Responde LISTO cuando termines." |
 | Abandoned payment | "⏰ Pedido #047 sin pago después de 2 hrs · Rosa Ríos" |
+| Installment paid | "💚 Abono recibido · Pedido #052 Boda García · $1,500 MXN · Pagado: $3,000 / $8,500 MXN" |
+| Installment due in 3 days | "📅 Próximo abono · Pedido #052 Boda García · $1,500 MXN · Vence: Viernes 30 mayo" |
+| Installment overdue | "🚨 Abono vencido · Pedido #052 Boda García · $1,500 MXN · Venció hace 2 días" |
+| Plan fully paid | "🎉 ¡Pago completo! Pedido #052 Boda García · $8,500 MXN pagados · Evento: 15 junio" |
 
 ---
 
-## 11. Technology Stack & Monthly Cost
+## 11. Public Customer Catalog
+
+**URL:** `jenny-floreria.vercel.app` (or custom domain)
+**Purpose:** Customers browse full inventory with photos, prices, customization options, and tap to order via WhatsApp. No account creation needed.
+
+### Who Uses It
+- Any customer — via link shared on WhatsApp, Instagram bio, business cards, shop signage
+- Especially useful for older customers who want to see photos before deciding
+- Pre-fills WhatsApp message so they don't have to type from scratch
+
+### Page Layout (Elderly-Friendly)
+
+```
+┌─────────────────────────────────────┐
+│  🌸 Jenny Florería - Guasave        │
+│  📞 668-XXX-XXXX                    │
+├─────────────────────────────────────┤
+│  [🌹 Flores] [💐 Arreglos]         │
+│  [👑 Coronas] [🎊 Eventos] [Todos] │
+│  ← filter tabs, large tap targets  │
+├─────────────────────────────────────┤
+│  ┌──────────┐  Rosas Rojas         │
+│  │  [photo] │  $180 MXN / arreglo  │
+│  │          │  🎂 Cumpleaños       │
+│  └──────────┘  💒 Aniversario      │
+│  [Ver opciones y ordenar →]        │
+├─────────────────────────────────────┤
+│  ┌──────────┐  Girasoles           │
+│  │  [photo] │  $220 MXN            │
+│  └──────────┘  [Ver opciones →]   │
+└─────────────────────────────────────┘
+```
+
+- Minimum 18px text, 48px tap targets
+- Large product photos (full width on mobile)
+- Filter by occasion: Cumpleaños / Boda / Quinceañera / Aniversario / Funeral / Todos
+- Out-of-stock items shown greyed out with "Agotado" badge — not hidden
+
+### Product Detail Page (Per Flower)
+
+```
+[Large photo]
+Rosas Rojas — $180 MXN base
+
+📝 Hermoso arreglo de rosas rojas frescas,
+   ideal para cumpleaños y aniversarios.
+
+Elige tu tamaño:
+○ Pequeño  — $150 MXN
+● Mediano  — $180 MXN  ← default
+○ Grande   — $250 MXN
+
+Elige color:
+[Rojo ✓] [Blanco] [Rosa] [Amarillo]
+
+Extras opcionales:
+☐ Jarrón de vidrio     +$50
+☐ Listón personalizado +$20
+☐ Tarjeta impresa      +$15
+
+¿Algún detalle especial?
+[campo de texto libre]
+
+Total estimado: $180 MXN
+
+[🛒 Ordenar por WhatsApp]
+```
+
+### "Ordenar por WhatsApp" Button
+Generates a pre-filled WhatsApp deep link:
+```
+https://wa.me/526681234567?text=Hola!%20Quiero%20ordenar%3A%0A
+%F0%9F%8C%B9%20Rosas%20Rojas%20Medianas%20(rojo)%0A
+%20%20+%20Jarr%C3%B3n%20de%20vidrio%0ATotal%20estimado%3A%20%24230%20MXN
+```
+Customer taps → WhatsApp opens with pre-filled message → AI receives it and continues from there. Customer never types from scratch.
+
+### Catalog Sync
+Supabase → catalog page reads directly via Supabase public API (RLS policy: read-only on active flowers). No sync needed — always live.
+
+---
+
+## 12. Order Customization System
+
+Customizations flow through every layer: catalog → WhatsApp AI → voice AI → order record → driver dispatch message → dashboard.
+
+### How AI Collects Customizations (WhatsApp)
+
+When customer selects an item with `customization_options`, AI presents options one at a time:
+
+```
+"Perfecto, elegiste Rosas Rojas 🌹
+
+¿Qué tamaño prefieres?
+1️⃣ Pequeño — $150 MXN
+2️⃣ Mediano — $180 MXN
+3️⃣ Grande  — $250 MXN"
+
+→ Customer: "2"
+
+"¿De qué color?
+1️⃣ Rojo
+2️⃣ Blanco
+3️⃣ Rosa
+4️⃣ Amarillo"
+
+→ Customer: "3"  (Rosa)
+
+"¿Deseas agregar algo extra?
+1️⃣ Jarrón de vidrio    +$50
+2️⃣ Listón personalizado +$20
+3️⃣ Tarjeta impresa     +$15
+4️⃣ Sin extras
+
+(Puedes elegir varios, ej: 1 y 2)"
+
+→ Customer: "2"
+
+"¿Algún detalle especial para el listón
+ u otra nota para este arreglo?
+(Responde NO si no hay nada especial)"
+
+→ Customer: "listón color azul cielo si es posible"
+```
+
+All selections stored in `order_items.customizations` JSON. Customizations appear in:
+- Order confirmation message to customer
+- Driver dispatch message
+- Dashboard order detail view
+- Delivery card printed in-shop (future)
+
+### Items Without Customization
+If `customization_options` is null for a flower, AI skips customization questions entirely — no friction for simple items.
+
+---
+
+## 13. Event & Wedding Installment Payments
+
+For large orders (weddings, quinceañeras, graduations, corporate events) where the total may be $3,000–$20,000+ MXN, customers can pay in scheduled installments leading up to the event date.
+
+### How It Works — Full Flow
+
+```
+Customer (WhatsApp or call):
+"Quiero hacer un pedido para una boda,
+ el 15 de junio. ¿Puedo pagar poco a poco?"
+        │
+        ▼
+AI detects event/wedding order type
+Collects: event date, full order details,
+          customer's preferred payment schedule
+        │
+        ▼
+n8n creates in Supabase:
+  orders row  (order_type="wedding", event_date=June 15)
+  payment_plans row (total=$8,500 MXN)
+  payment_installments rows (3-4 installments)
+        │
+        ▼
+AI sends payment plan summary to customer:
+"¡Perfecto! Tu plan de pagos para la boda:
+
+ 💒 Pedido Boda García — $8,500 MXN total
+ 📅 Evento: 15 de junio
+
+ Plan de pagos:
+ ✅ Abono 1: $2,500 MXN — hoy (reserva)
+ ⏳ Abono 2: $2,000 MXN — 1 de junio
+ ⏳ Abono 3: $2,000 MXN — 10 de junio
+ ⏳ Abono 4: $2,000 MXN — 13 de junio (saldo final)
+
+ Total: $8,500 MXN
+
+ ¿Confirmas este plan? Responde SÍ o NO"
+        │
+Customer confirms
+        │
+        ▼
+First installment MercadoPago link sent immediately
+Remaining installments scheduled in n8n
+```
+
+### Installment Reminder Flow (n8n Scheduled)
+
+```
+3 days before due date → WhatsApp to customer:
+"📅 Recordatorio de abono — Jenny Florería
+ Pedido: Boda García (#052)
+ Monto: $2,000 MXN
+ Fecha límite: 1 de junio
+ 
+ [Link de pago MercadoPago]
+ 
+ ¿Tienes alguna duda? Escríbenos 😊"
+
+1 day before due date → second reminder
+
+Day of due date (if unpaid):
+"⏰ Tu abono de $2,000 MXN vence HOY.
+ Pedido Boda García. [Link de pago]"
+
+1 day overdue → alert to Carmelita on personal WhatsApp:
+"🚨 Abono vencido · Boda García · $2,000 MXN
+ Vencía ayer. Considera contactar al cliente."
+```
+
+### Installment Payment Confirmation
+
+```
+Customer pays installment
+        │
+        ▼
+MercadoPago webhook → n8n
+n8n updates:
+  payment_installments.status = "paid"
+  payment_plans.amount_paid_mxn += amount
+  orders.amount_paid_mxn += amount
+        │
+  All paid?──yes──→ orders.status = "paid"
+                    → normal delivery flow begins
+     │
+    no
+     │
+     ▼
+Customer confirmation:
+"💚 ¡Abono recibido! Gracias 🌸
+ Pagado: $4,500 / $8,500 MXN
+ Próximo abono: $2,000 MXN el 10 de junio"
+
+Carmelita notification:
+"💚 Abono recibido · Boda García · $2,000 MXN
+ Total pagado: $4,500 / $8,500 MXN"
+```
+
+### Dashboard — Event Orders Panel
+
+Separate section in dashboard for event/wedding orders showing:
+- Order name, customer, event date
+- Progress bar: amount paid / total (e.g. $4,500 / $8,500)
+- Upcoming installments with due dates
+- [Ver Plan] → full installment timeline with statuses
+- [Editar Plan] → Carmelita can adjust amounts/dates if agreed with customer
+- Color-coded: 🟢 on track · 🟡 due soon · 🔴 overdue
+
+### Carmelita Creates Payment Plan (Dashboard)
+
+For orders negotiated in person or by call:
+```
+Dashboard → Pedidos → [+ Evento/Boda]
+1. Customer name + WhatsApp number
+2. Order details (items, customizations)
+3. Event date
+4. Total amount
+5. Number of installments (2 / 3 / 4 / custom)
+   → system auto-distributes amounts and dates
+   → Carmelita can adjust each installment manually
+6. [Crear Plan] → plan created + first payment link sent to customer WA
+```
+
+### Payment Plan Rules
+- First installment (deposit/reserva) required immediately to confirm event slot
+- Minimum deposit: 25% of total (configurable by Carmelita)
+- Full payment required at least 2 days before event date
+- If plan goes overdue by 7+ days → Carmelita notified, order not automatically cancelled (she decides)
+
+---
+
+## 14. Technology Stack & Monthly Cost
+
 
 | Service | Purpose | Cost |
 |---|---|---|
@@ -672,7 +1032,7 @@ MercadoPago fees: ~3.49% + IVA for cards, ~$13 MXN flat for OXXO.
 
 ---
 
-## 12. Voice Clone Recording Guide (For Carmelita)
+## 15. Voice Clone Recording Guide (For Carmelita)
 
 **Before building the voice agent, Carmelita must complete this one-time recording session.**
 
@@ -687,17 +1047,19 @@ MercadoPago fees: ~3.49% + IVA for cards, ~$13 MXN flat for OXXO.
 
 ---
 
-## 13. What Carmelita Does Daily
+## 16. What Carmelita Does Daily
 
 After system is live, her daily tasks are minimal:
 
 | Task | How |
 |---|---|
 | Check new orders | Glance at WhatsApp notifications or open dashboard |
-| Update flower stock | Dashboard → Inventario → tap flower → update number |
-| Add new flower | Dashboard → Inventario → [+ Agregar Flor] |
+| Add new arrival flowers/ornaments | Dashboard → Inventario → [📦 Llegó Mercancía] → 4 steps, ~60 sec per item |
+| Update existing flower stock | Dashboard → Inventario → tap flower → tap stock number → update |
 | Handle escalated customer | Reply to WhatsApp forwarded message → type LISTO when done |
 | Create a promo code | Dashboard → Códigos → [+ Crear Código] |
+| Create event/wedding payment plan | Dashboard → Pedidos → [+ Evento/Boda] → fill form → system sends plan to customer |
+| Check installment status | Dashboard → Eventos → see progress bar per order |
 | View today's revenue | Dashboard → Ventas |
 
 She does NOT need to:
@@ -709,7 +1071,7 @@ She does NOT need to:
 
 ---
 
-## 14. Future Expansion (Not In Scope Now)
+## 17. Future Expansion (Not In Scope Now)
 
 - Loyalty program (points per order)
 - Recurring subscription orders ("flores cada semana")
