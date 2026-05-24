@@ -310,7 +310,7 @@ Trigger Dispatch (HTTP POST to n8n dispatch webhook with { order_id })
 | Two drivers ACEPTO at same time | Atomic PATCH on DB — first writer wins, second gets "ya tomado" |
 | All drivers busy | Immediate WhatsApp alert to Carmelita |
 | All drivers reject | No action — Carmelita alerted at 15-min mark |
-| Driver says ENTREGADO with photo | Photo URL saved to `orders.delivery_photo_url` (Phase 6 dashboard shows it) |
+| Driver sends image + caption ENTREGADO | WhatsApp sends `type: image` with caption. Workflow checks caption for ENTREGADO keyword, marks delivered. Photo media retrieval deferred to Phase 6. |
 | Unrecognized driver message | Silently ignored — no reply sent |
 | Scheduled order, driver dispatched early | Scheduler skips if `driver_id IS NOT NULL` already set |
 
