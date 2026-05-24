@@ -10,6 +10,8 @@
 
 Automate delivery dispatch entirely over WhatsApp. When an order is paid, drivers get notified automatically, the first to accept gets assigned, and everyone — customer, driver, and Carmelita — gets a clear update at each step. No app. No dashboard needed for dispatch. Just WhatsApp messages in plain Spanish.
 
+**Driver capacity:** Up to 5 active drivers in the system. Broadcasting to 5 drivers simultaneously maximizes acceptance rate and minimizes "all busy" situations — critical during peak periods like Día de las Madres and San Valentín.
+
 ---
 
 ## Who Does What
@@ -318,7 +320,15 @@ Trigger Dispatch (HTTP POST to n8n dispatch webhook with { order_id })
 
 ## Setup Steps (After Code Deployed)
 
-1. **Add drivers to Supabase:** `INSERT INTO drivers (name, whatsapp_phone, preferred_payment) VALUES ('Marco', '521668XXXXXX', 'cash')`
+1. **Add up to 5 drivers to Supabase:**
+```sql
+INSERT INTO drivers (name, whatsapp_phone, preferred_payment) VALUES
+  ('Marco',    '521668XXXXXX', 'cash'),
+  ('Luis',     '521668XXXXXX', 'cash'),
+  ('Roberto',  '521668XXXXXX', 'transfer'),
+  ('Carlos',   '521668XXXXXX', 'cash'),
+  ('Fernando', '521668XXXXXX', 'transfer');
+```
 2. **Import workflows 11 and 12** into n8n Cloud → activate both
 3. **Re-import workflow 01** (updated with driver branch) → activate
 4. **Re-import workflow 04** (updated with dispatch trigger) → activate
