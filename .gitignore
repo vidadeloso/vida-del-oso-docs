@@ -5,7 +5,7 @@
 # Floreria planning docs below. Everything else in $HOME is ignored by
 # default so a stray `git add -A` / `git add .` from the home directory
 # can never sweep up SSH keys, credentials, or unrelated project files
-# into this remote (github.com/vidadeloso/Jenny-Floreria, which is PUBLIC).
+# into this remote (github.com/vidadeloso/vida-del-oso-docs, which is PUBLIC).
 #
 # Already-tracked files are unaffected by this file — it only blocks new
 # files from being added by accident.
